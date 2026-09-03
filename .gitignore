@@ -1,0 +1,32 @@
+# ── Credentials & secrets ─────────────────────────────────────────────────
+config.yaml          # contains real API keys, passwords, TOTP secrets
+access_token.txt     # Kite access token (regenerated daily)
+*.token
+*.secret
+.env
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+env/
+
+# ── Data & logs ───────────────────────────────────────────────────────────
+trading_bot.db       # live trade database
+*.db
+*.log
+logs/
+
+# ── IDE & OS ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

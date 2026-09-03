@@ -1,0 +1,352 @@
+# ─────────────────────────────────────────
+#  Data source for chart data (FREE!)
+#  "angel"    — Real-time, zero delay ✅ (recommended, free Angel One account)
+#  "yfinance" — 1-3 min delay, no account needed
+#  "kite"     — Real-time, requires ₹2000/month subscription
+# ─────────────────────────────────────────
+data_source: "yfinance"
+
+# ─────────────────────────────────────────
+#  Paper trading / dry run mode
+#  Set true to simulate without placing real orders — USE THIS FIRST!
+# ─────────────────────────────────────────
+dry_run: true
+kite:
+  api_key: "YOUR_KITE_API_KEY"
+  api_secret: "YOUR_KITE_API_SECRET"
+  access_token_file: "access_token.txt"
+
+# ─────────────────────────────────────────
+#  Angel One SmartAPI (free real-time data)
+#  Get API key from: https://smartapi.angelbroking.com
+#  totp_secret: scan the QR code Angel shows during 2FA setup
+#               with an authenticator app → get the secret key
+# ─────────────────────────────────────────
+angel:
+  api_key: "YOUR_ANGEL_API_KEY"
+  client_id: "YOUR_CLIENT_ID"       # e.g. A123456
+  password: "YOUR_PASSWORD"
+  totp_secret: "YOUR_TOTP_SECRET"   # base32 secret from Angel 2FA setup
+  # Optional: enable WebSocket for instant SL/target triggers (0ms latency)
+  use_websocket: true
+
+# ─────────────────────────────────────────
+#  Stocks to watch (NSE symbols)
+# ─────────────────────────────────────────
+#  Intraday fallback watchlist (used if watchlist_builder is disabled)
+#  Best intraday stocks: high liquidity, high beta, Nifty 50
+# ─────────────────────────────────────────
+watchlist:
+  - RELIANCE
+  - HDFCBANK
+  - ICICIBANK
+  - SBIN
+  - AXISBANK
+  - BAJFINANCE
+  - ADANIENT
+  - WIPRO
+  - TCS
+  - INFY
+  - ONGC
+  - COALINDIA
+  - TATASTEEL
+  - JSWSTEEL
+  - HINDALCO
+  - MARUTI
+  - TITAN
+  - BAJAJ-AUTO
+
+# ─────────────────────────────────────────
+#  Smart Watchlist Builder (pre-market screener)
+#  Runs before market open to auto-select best breakout candidates
+#  from ALL NSE stocks. Set enabled: true to activate.
+# ─────────────────────────────────────────
+watchlist_builder:
+  enabled: true
+  max_watchlist_size: 100        # ✅ scan top 100 stocks each day
+  min_price: 50
+  max_price: 10000
+  min_avg_daily_volume: 500000   # raised for intraday — need highly liquid stocks
+  ema_period: 200
+  rs_lookback_days: 90
+  batch_size: 20                 # fetch 20 stocks per API call (was 1 at a time)
+  batch_delay_seconds: 1.0       # 1s between batches (was 0.2s per stock)
+  universe: "nifty500"           # score all 500, pick top 100 by score
+
+# ─────────────────────────────────────────
+#  Strategy settings — INTRADAY OPTIMISED
+# ─────────────────────────────────────────
+strategy:
+  # 5-min candles: faster signals for intraday
+  interval: "5minute"
+  lookback_candles: 20
+  volume_multiplier: 1.5
+  min_breakout_pct: 0.2         # lower for intraday moves
+
+  enable_resistance_breakout: true
+  enable_volume_breakout: true
+  enable_52week_high_breakout: false  # less useful intraday
+  enable_bb_squeeze_breakout: true
+  enable_bb_squeeze_short: false   # disabled — 50% win rate, net negative P&L
+  enable_orb: true              # ✅ Opening Range Breakout — best intraday strategy
+  enable_nr7: true              # ✅ NR7 Breakout — compressed energy explosion
+  enable_vwap_pullback: true    # ✅ VWAP Pullback — institutional anchor strategy
+  enable_ema_pullback: true     # ✅ EMA 9/21 Pullback — buy/short the trend pullback
+
+  orb_minutes: 15               # range set from 9:15 to 9:30
+  orb_volume_multiplier: 1.5
+  orb_max_entry_delay_minutes: 30  # only take ORB signals within 30 min of range end (9:30–10:00)
+
+  # ── Gap & Go settings ────────────────────────────────────────────────────
+  gap_and_go:
+    min_gap_pct: 1.0            # minimum gap % from previous close to qualify
+    max_gap_pct: 5.0            # skip gaps >5% (too extended, likely to reverse)
+    volume_multiplier: 1.5      # volume must be 1.5× average on gap candle
+
+  # ── VWAP Pullback settings ────────────────────────────────────────────────
+  vwap_pullback:
+    pullback_min_pct: 0.8       # price must have moved ≥0.8% from VWAP before pullback
+    proximity_pct: 0.15         # must pull back to within 0.15% of VWAP
+    volume_multiplier: 1.3      # bounce candle volume vs average
+
+  # ── EMA Pullback settings ─────────────────────────────────────────────────
+  ema_pullback:
+    fast_period: 9
+    slow_period: 21
+    proximity_pct: 0.3          # price must touch within 0.3% of EMA21
+    volume_multiplier: 1.2
+
+  # ── SuperTrend filter ─────────────────────────────────────────────────────
+  supertrend:
+    enabled: true
+    period: 7
+    multiplier: 3.0             # higher = less sensitive (fewer flips)
+
+  # ORB alone scores 4 → passes min_priority_score on its own ✅
+  min_signals_required: 1
+  min_priority_score: 4
+
+  strategy_scores:
+    gap_and_go_long:        5   # ★★ strongest — gap + momentum
+    gap_and_go_short:       5
+    orb_long:               4   # ★ best for intraday
+    orb_short:              4
+    nr7_breakout:           4   # energy expansion
+    vwap_pullback_long:     4   # institutional anchor
+    vwap_pullback_short:    4
+    ema_pullback_long:      3
+    ema_pullback_short:     3
+    volume_breakout:        3
+    volume_breakdown_short: 3
+    bb_squeeze_breakout:    3
+    bb_squeeze_short:       3
+    52week_high_breakout:   2
+    52week_low_breakdown:   2
+    resistance_breakout:    1
+    support_breakdown:      1
+
+  bb_period: 20
+  bb_std: 2.0
+  bb_squeeze_threshold_pct: 3.0
+  # ── BB Squeeze late-entry guards ─────────────────────────────────────────
+  # Block bb_squeeze signals if price already moved more than this % from
+  # today's open (avoids entering exhausted moves near intraday highs/lows)
+  bb_max_move_from_open_pct: 2.0
+  # Require at least one pullback/retest candle before the breakout fires
+  # (reduces false entries; does not affect ORB signals)
+  bb_require_pullback: true
+
+# ─────────────────────────────────────────
+#  Technical Indicators
+#  Used to filter, score, and size trades.
+# ─────────────────────────────────────────
+indicators:
+  vwap:
+    enabled: true
+    score_bonus: 1          # +1 when price is on the correct side of VWAP
+
+  rsi:
+    enabled: true
+    period: 14
+    score_bonus: 1          # +1 when RSI shows momentum (≥60 long, ≤40 short)
+    momentum_min: 60        # long: RSI above this = momentum confirmed
+    momentum_max: 40        # short: RSI below this = bearish momentum confirmed
+    overbought: 75          # BLOCK long entry above this (extended, likely to pull back)
+    oversold: 25            # BLOCK short entry below this (already dumped)
+
+  atr:
+    enabled: true
+    period: 14
+    multiplier: 2.0         # SL = entry ± (2.0 × ATR)  — looser, more room for volatility
+    use_for_sl: true        # replaces fixed stop_loss_pct with ATR-based SL
+
+  adx:
+    enabled: true
+    period: 14
+    min_trending: 20        # ORB signals BLOCKED if ADX < 20 (market is choppy/sideways)
+    strong_trend: 25        # +1 score bonus when ADX > 25 (strong trend)
+    score_bonus: 1
+
+# ─────────────────────────────────────────
+#  Trade / risk management settings
+# ─────────────────────────────────────────
+trade:
+  # Max capital to deploy per trade (INR)
+  max_capital_per_trade: 15000
+  # Minimum own capital required to open a trade — skips if remaining daily cap is below this
+  min_capital_per_trade: 3000
+  # MIS intraday margin multiplier (Zerodha provides up to 5x for equity MIS)
+  # Effective buying power = max_capital_per_trade × mis_margin_multiplier
+  # Set to 1.0 to disable margin and trade only with your own capital
+  mis_margin_multiplier: 5.0
+  # Hard cap on total own capital deployed per day across all trades (₹)
+  # Bot will stop opening new positions once this is reached
+  max_daily_capital: 60000
+  # ── Position Sizing ─────────────────────────────────────────────────────
+  # "fixed_capital" = qty = (capital × margin) / price  [current behaviour]
+  # "atr_risk"      = risk same ₹ per trade regardless of stock volatility
+  position_sizing:
+    method: "atr_risk"            # atr_risk gives consistent risk per trade
+    risk_pct_per_trade: 1.0       # risk 1% of total_capital per trade
+    max_risk_per_trade: 500       # cap at ₹500 risk per trade regardless
+
+  # ── Partial Exit ────────────────────────────────────────────────────────
+  # Exit 50% at 1× risk reward → move SL to breakeven → trail the rest
+  partial_exit:
+    enabled: true                 # set false to disable partial exits
+
+  profit_target_pct: 1.5        # intraday: realistic 1.5% target
+  stop_loss_pct: 0.8            # intraday: tight 0.8% SL
+  max_open_positions: 4         # max 4 concurrent open positions
+  exchange: "NSE"
+  product: "MIS"                # ✅ intraday only — auto square-off
+  order_type: "MARKET"
+
+  # ── Per-signal profit targets ────────────────────────────────────────────
+  # ORB breakouts have larger moves; give them more room
+  # BB squeeze targets are kept tighter since they fire later in a move
+  signal_profit_targets:
+    gap_and_go_long:        2.5
+    gap_and_go_short:       2.5
+    orb_long:               2.5
+    orb_short:              2.0
+    nr7_breakout:           2.0   # fast expansion — take profits quickly
+    vwap_pullback_long:     1.5   # VWAP targets are tighter
+    vwap_pullback_short:    1.5
+    ema_pullback_long:      1.5
+    ema_pullback_short:     1.5
+    bb_squeeze_breakout:    1.5
+    bb_squeeze_short:       1.5
+    volume_breakout:        2.0
+    volume_breakdown_short: 2.0
+
+  # ── ORB trailing-only exit ───────────────────────────────────────────────
+  # When true, ORB trades have no fixed ceiling — trailing SL rides the move
+  # Set false to use orb_long/orb_short targets from signal_profit_targets above
+  orb_trailing_only: false
+  # Disabled — was applying trailing-only even when ADX data wasn't available,
+  # causing target_price = fill_price × 10 (never reached) on all ORB longs
+  orb_adx_trailing_dynamic: false
+
+  # ── Short Selling ───────────────────────────────────────────────────────
+  allow_short: true             # ✅ enabled — MIS allows short selling
+  short_profit_target_pct: 1.5
+  short_stop_loss_pct: 0.8
+
+  # ── Trailing Stop-Loss ──────────────────────────────────────────────────
+  trailing_stop_loss:
+    enabled: true
+    trail_pct: 0.5              # tightened from 1.0 — locks in more profit, fewer force-closes at breakeven
+    tighten_after_time: "12:30" # after 12:30 PM use tighter trail — momentum fading
+    tighten_trail_pct: 0.3      # 0.3% trail after 12:30 PM
+
+  # ── Force-Close Behaviour ───────────────────────────────────────────────
+  force_close:
+    protect_profit: true               # if position is in profit, tighten trail first instead of flat close
+    profit_protection_trail_pct: 0.1   # very tight trail on profitable positions at force-close time
+    profit_protection_window_s: 60     # wait up to 60s for tight trail to fire before hard-closing
+
+  # ── Daily Loss Circuit Breaker ──────────────────────────────────────────
+  max_daily_loss_pct: 2.0       # stop if down 2% on capital in a day
+  total_capital: 50000
+  stop_loss_pct: 1.2            # fixed SL percent if ATR-based SL is disabled
+  # ── Multi-Timeframe Confirmation ────────────────────────────────────────
+  multi_timeframe:
+    enabled: true
+    confirm_interval: "15minute"  # intraday: 5min signal + 15min confirms
+    # ORB signals are already time-gated — MTF check defeats the purpose
+    skip_mtf_for_signals: ["orb_long", "orb_short"]
+
+# ─────────────────────────────────────────
+#  Market Filters — India VIX & Nifty Trend
+#  Applied before every signal to avoid trading in bad market conditions.
+# ─────────────────────────────────────────
+market_filters:
+  india_vix:
+    enabled: true
+    block_above: 22             # VIX > 22 = panic → block ALL breakout signals
+    reduce_size_above: 18       # VIX 18-22 = volatile → trade at 50% size
+    reduce_size_below: 13       # VIX < 13 = too calm → 50% size (low follow-through)
+    reduce_size_factor: 0.5     # position size multiplier when VIX out of ideal zone
+
+  nifty_trend:
+    enabled: true
+    block_longs_below_pct: -0.5   # Nifty down >0.5% from open → block LONG signals
+    block_shorts_above_pct: 0.5   # Nifty up >0.5% from open → block SHORT signals
+    min_move_for_orb_pct: 0.3     # Nifty must move >0.3% either way for ORB to be valid
+                                  # Flat Nifty = no institutional momentum = ORB fails
+
+# ─────────────────────────────────────────
+#  Sector Momentum Filter
+#  Checks if stock's sector index is trending the same way as the trade.
+#  LONG signal: sector must be neutral or bullish (+0 or above)
+#  SHORT signal: sector must be neutral or bearish (0 or below)
+# ─────────────────────────────────────────
+sector_filter:
+  enabled: true
+  # When true, signals in opposite-sector are rejected (stricter)
+  require_alignment: true
+  # Bonus score added to watchlist stocks in strong/trending sectors
+  # Strong-sector stocks rank higher in pre-market watchlist build
+  sector_bonus: 2
+
+# ─────────────────────────────────────────
+#  Telegram Alerts
+#  Get token: message @BotFather on Telegram → /newbot
+#  Get chat_id: message @userinfobot on Telegram
+# ─────────────────────────────────────────
+telegram:
+  enabled: false          # set true once you add token + chat_id
+  bot_token: "YOUR_BOT_TOKEN"
+  chat_id: "YOUR_CHAT_ID"
+  # Which events to alert on
+  alert_on_buy: true
+  alert_on_sell: true
+  alert_on_error: true
+  alert_daily_summary: true    # sent at 3:30 PM each day
+
+# ─────────────────────────────────────────
+#  Scheduler settings
+# ─────────────────────────────────────────
+scheduler:
+  scan_interval_minutes: 5
+  market_open: "09:15"
+  market_close: "15:20"
+  skip_weekends: true
+  dead_zone_start: "11:00"          # 11-12 AM low volume — raise min score by +1
+  dead_zone_end: "12:00"
+  # ── Intraday time filters ─────────────────────────────────────────────
+  # Skip first N minutes (opening volatility / gap fills)
+  skip_opening_minutes: 15      # no trades 9:15–9:30
+  # ORB signals: no new entries after this time
+  no_new_positions_after: "11:00"
+  # VWAP/EMA/NR7 pullback signals: extended window into afternoon momentum
+  no_new_positions_after_non_orb: "13:00"  # extended from 12:30 — catches afternoon re-entries
+  min_minutes_before_force_close: 20       # never enter within 20 min of 1:30 PM force close
+
+# ─────────────────────────────────────────
+#  Logging
+# ─────────────────────────────────────────
+logging:
+  level: "INFO"
+  log_file: "logs/bot.log"
