@@ -52,6 +52,20 @@ def compute_vwap(df: pd.DataFrame) -> float | None:
 
 
 # ── RSI ────────────────────────────────────────────────────────────────────
+def compute_rsi_series(df: pd.DataFrame, period: int = 14) -> pd.Series | None:
+    """Full RSI series (0-100) for the given lookback — lets callers inspect
+    recent bars, not just the latest value (e.g. to detect a bounce off
+    oversold rather than a stable oversold reading)."""
+    if len(df) < period + 1:
+        return None
+    delta = df["close"].diff()
+    gain  = delta.clip(lower=0).rolling(period).mean()
+    loss  = (-delta.clip(upper=0)).rolling(period).mean()
+    rs    = gain / loss.replace(0, np.nan)
+    rsi   = 100 - (100 / (1 + rs))
+    return rsi
+
+
 def compute_rsi(df: pd.DataFrame, period: int = 14) -> float | None:
     """
     Relative Strength Index (0–100).
@@ -60,14 +74,10 @@ def compute_rsi(df: pd.DataFrame, period: int = 14) -> float | None:
       < 40 : bearish momentum, aligned with shorts
       < 25 : oversold — avoid new shorts
     """
-    if len(df) < period + 1:
+    rsi = compute_rsi_series(df, period)
+    if rsi is None:
         return None
-    delta = df["close"].diff()
-    gain  = delta.clip(lower=0).rolling(period).mean()
-    loss  = (-delta.clip(upper=0)).rolling(period).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    rsi   = 100 - (100 / (1 + rs))
-    val   = float(rsi.iloc[-1])
+    val = float(rsi.iloc[-1])
     return val if not np.isnan(val) else None
 
 
@@ -166,23 +176,40 @@ def evaluate_indicators(
     # ── RSI ─────────────────────────────────────────────────────────────────
     rsi_cfg = ind_cfg.get("rsi", {})
     if rsi_cfg.get("enabled", True):
-        rsi    = compute_rsi(df, rsi_cfg.get("period", 14))
+        rsi_series = compute_rsi_series(df, rsi_cfg.get("period", 14))
+        rsi        = float(rsi_series.iloc[-1]) if rsi_series is not None and not np.isnan(rsi_series.iloc[-1]) else None
         result.rsi = rsi
         if rsi is not None:
             overbought = rsi_cfg.get("overbought", 75)
             oversold   = rsi_cfg.get("oversold",   25)
             bonus      = rsi_cfg.get("score_bonus", 1)
 
+            # Was RSI recently at the opposite extreme and is now bouncing
+            # back through it? A stock just ticking above `oversold` after
+            # sitting below it is still in reversal-bounce territory, not a
+            # confirmed downtrend continuation — dangerous to short into.
+            # (e.g. SHRIRAMFIN 2026-09-08: RSI 18→27 in ~35 min, shorted right
+            # into the bounce, stopped out shortly after.)
+            check_bounce = rsi_cfg.get("block_recent_extreme_reversal", True)
+            lookback     = rsi_cfg.get("reversal_lookback_bars", 5)
+            recent       = rsi_series.iloc[-(lookback + 1):-1] if len(rsi_series) > lookback else rsi_series.iloc[:-1]
+
             if direction == "long":
                 if rsi > overbought:
                     result.blocked      = True
                     result.block_reason = f"RSI={rsi:.0f} overbought (>{overbought})"
+                elif check_bounce and rsi <= overbought and not recent.empty and (recent > overbought).any():
+                    result.blocked      = True
+                    result.block_reason = f"RSI={rsi:.0f} just bounced down from overbought — reversal risk, not confirmed"
                 elif rsi >= rsi_cfg.get("momentum_min", 60):
                     result.score_delta += bonus   # strong momentum
             elif direction == "short":
                 if rsi < oversold:
                     result.blocked      = True
                     result.block_reason = f"RSI={rsi:.0f} oversold (<{oversold})"
+                elif check_bounce and rsi >= oversold and not recent.empty and (recent < oversold).any():
+                    result.blocked      = True
+                    result.block_reason = f"RSI={rsi:.0f} just bounced up from oversold — reversal risk, not confirmed"
                 elif rsi <= rsi_cfg.get("momentum_max", 40):
                     result.score_delta += bonus   # strong bearish momentum
             result.details["rsi"] = round(rsi, 1)

@@ -73,6 +73,19 @@ class Screener:
         # Daily rejection cache: {(symbol, direction): date} — cleared each new trading day
         self._rejected_cache: dict[tuple, date] = {}
         self._cache_date: date = date.today()
+        # Per-scan candle cache: {(symbol, interval): df} — avoids fetching the
+        # same candles twice (long scan + short scan used to each fetch it
+        # separately, doubling scan time and slowing the whole loop down).
+        self._df_cache: dict[tuple, object] = {}
+
+    def _get_df(self, symbol: str, interval: str):
+        """Fetch candles once per scan cycle and reuse across long/short checks."""
+        key = (symbol, interval)
+        if key not in self._df_cache:
+            self._df_cache[key] = self.fetcher.get_candles(
+                symbol, interval, self.cfg["trade"]["exchange"]
+            )
+        return self._df_cache[key]
 
     def scan(self, watchlist: list[str]) -> list[BreakoutSignal]:
         """
@@ -84,6 +97,9 @@ class Screener:
         if today != self._cache_date:
             self._rejected_cache.clear()
             self._cache_date = today
+
+        # Fresh candle cache for this scan cycle (long+short reuse same fetch)
+        self._df_cache.clear()
 
         # Refresh sector scores once per scan cycle
         if self.sector:
@@ -149,10 +165,19 @@ class Screener:
             return None
 
         # ── Market filter (VIX + Nifty trend) ─────────────────────────────
-        # Pick best signal first so we can pass signal_type to market filter
+        # Prefer a non-exempt signal type for the filter check: if ANY triggered
+        # signal is a real breakout/breakdown type (not exempt from the flat-market
+        # gate), the combined confirmation is only as reliable as that component,
+        # even if a higher-priority exempt signal (e.g. ema_pullback) also fired.
+        # Picking purely by priority order let breakdown/breakout signals sneak
+        # through flat days riding on an exempt signal's pass (e.g. ICICIBANK
+        # 52week_low_breakdown + ema_pullback_short on a flat Nifty day).
+        exempt = getattr(self.mf, "flat_market_exempt", set())
+        non_exempt_triggered = [s for s in triggered if s.signal_type not in exempt]
+        filter_pool = non_exempt_triggered or triggered
         best_for_filter = next(
-            (s for p in priority_order for s in triggered if s.signal_type == p),
-            triggered[0],
+            (s for p in priority_order for s in filter_pool if s.signal_type == p),
+            filter_pool[0],
         )
         blocked, block_reason = self.mf.should_block(direction, best_for_filter.signal_type)
         if blocked:
@@ -178,13 +203,45 @@ class Screener:
         )
 
         if len(triggered) < min_required or total_score < effective_min_score:
-            reason = []
-            if len(triggered) < min_required:
-                reason.append(f"{len(triggered)}/{min_required} strategies")
-            if total_score < effective_min_score:
-                reason.append(f"score {total_score}/{effective_min_score}{' [dead zone]' if effective_min_score > min_score else ''}")
-            logger.info(f"⚠️  {symbol} [{direction}] skipped — {', '.join(reason)}")
-            return None
+            # ── Trend continuation bypass ──────────────────────────────────
+            # If the stock is already trending hard intraday (e.g. down/up X%
+            # from today's open) and a continuation-type signal (EMA pullback)
+            # fired, let it through on a lower score — we don't need full
+            # confluence to confirm a trend that's already clearly established.
+            tc_cfg = self.s_cfg.get("trend_continuation", {})
+            if tc_cfg.get("enabled", False) and best.signal_type in (
+                "ema_pullback_long", "ema_pullback_short"
+            ):
+                day_chg = best.details.get("day_change_pct", 0.0)
+                min_move = tc_cfg.get("min_move_pct", 1.0)
+                min_tc_score = tc_cfg.get("min_score", 2)
+                trending = (
+                    (direction == "long" and day_chg >= min_move) or
+                    (direction == "short" and day_chg <= -min_move)
+                )
+                if trending and total_score >= min_tc_score:
+                    logger.info(
+                        f"🏃 {symbol} [{direction}] trend continuation override — "
+                        f"day_change={day_chg:.2f}% score={total_score} "
+                        f"(bypassing {effective_min_score} threshold)"
+                    )
+                    # fall through — skip the rejection below
+                else:
+                    reason = []
+                    if len(triggered) < min_required:
+                        reason.append(f"{len(triggered)}/{min_required} strategies")
+                    if total_score < effective_min_score:
+                        reason.append(f"score {total_score}/{effective_min_score}{' [dead zone]' if effective_min_score > min_score else ''}")
+                    logger.info(f"⚠️  {symbol} [{direction}] skipped — {', '.join(reason)}")
+                    return None
+            else:
+                reason = []
+                if len(triggered) < min_required:
+                    reason.append(f"{len(triggered)}/{min_required} strategies")
+                if total_score < effective_min_score:
+                    reason.append(f"score {total_score}/{effective_min_score}{' [dead zone]' if effective_min_score > min_score else ''}")
+                logger.info(f"⚠️  {symbol} [{direction}] skipped — {', '.join(reason)}")
+                return None
 
         # Sector momentum filter — cache rejection for rest of day
         if self.sector and not self.sector.is_aligned(symbol, direction):
@@ -283,7 +340,7 @@ class Screener:
         bb_std     = self.s_cfg.get("bb_std", 2.0)
         bb_thresh  = self.s_cfg.get("bb_squeeze_threshold_pct", 3.0)
 
-        df = self.fetcher.get_candles(symbol, interval, self.cfg["trade"]["exchange"])
+        df = self._get_df(symbol, interval)
         if df is None or df.empty:
             return []
 
@@ -372,6 +429,9 @@ class Screener:
         # Attach indicator data to all triggered signals
         if triggered:
             self._attach_indicators(df, triggered, "short")
+            day_chg = self._day_change_pct(df)
+            for sig in triggered:
+                sig.details["day_change_pct"] = day_chg
 
         return triggered
 
@@ -384,7 +444,7 @@ class Screener:
         bb_std = self.s_cfg.get("bb_std", 2.0)
         bb_squeeze_thresh = self.s_cfg.get("bb_squeeze_threshold_pct", 3.0)
 
-        df = self.fetcher.get_candles(symbol, interval, self.cfg["trade"]["exchange"])
+        df = self._get_df(symbol, interval)
         if df is None or df.empty:
             logger.warning(f"Skipping {symbol}: no data")
             return []
@@ -428,7 +488,7 @@ class Screener:
                 triggered.append(sig)
 
         # Gap & Go long
-        if self.s_cfg.get("enable_gap_and_go", True):
+        if self.s_cfg.get("enable_gap_and_go", True) and self.s_cfg.get("enable_gap_and_go_long", True):
             gap_cfg = self.s_cfg.get("gap_and_go", {})
             sig = check_gap_and_go_long(
                 df, symbol,
@@ -489,8 +549,26 @@ class Screener:
         # Attach indicator data to all triggered signals
         if triggered:
             self._attach_indicators(df, triggered, "long")
+            day_chg = self._day_change_pct(df)
+            for sig in triggered:
+                sig.details["day_change_pct"] = day_chg
 
         return triggered
+
+    def _day_change_pct(self, df) -> float:
+        """% change from today's session open to the latest close (for trend-continuation checks)."""
+        try:
+            today = date.today()
+            day_df = df[df.index.date == today]
+            if day_df.empty:
+                day_df = df.tail(1)
+            day_open = float(day_df["open"].iloc[0])
+            last_close = float(df["close"].iloc[-1])
+            if day_open <= 0:
+                return 0.0
+            return (last_close - day_open) / day_open * 100
+        except Exception:
+            return 0.0
 
     def _attach_indicators(self, df, triggered: list, direction: str):
         """Compute indicators once per symbol and attach to all triggered signals."""

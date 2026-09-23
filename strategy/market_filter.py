@@ -113,6 +113,17 @@ class MarketFilter:
         # ORB-specific: minimum Nifty move required for ORB signals to be valid
         # If Nifty is flat (between -min and +min), ORB breakouts lack follow-through
         self.orb_min_move      = nf_cfg.get("min_move_for_orb_pct", 0.3)
+        # Extend the same flat-market gate to ALL breakout-type strategies, not
+        # just ORB. On flat/choppy days (Sep 2026 regime), bb_squeeze, gap_and_go,
+        # volume_breakout/breakdown etc. all lack follow-through the same way ORB
+        # does — they were quietly bleeding money while ORB sat correctly blocked.
+        # ema_pullback is exempt: it's a trend-CONTINUATION signal (confirms an
+        # already-established move), not a fresh breakout needing index confirmation.
+        self.flat_market_block_all = nf_cfg.get("flat_market_block_all_breakouts", True)
+        self.flat_market_exempt = set(nf_cfg.get(
+            "flat_market_exempt_signals",
+            ["ema_pullback_long", "ema_pullback_short"],
+        ))
 
     def should_block(self, direction: str, signal_type: str = "") -> tuple[bool, str]:
         """
@@ -133,12 +144,19 @@ class MarketFilter:
                 if direction == "short" and chg > self.nifty_short_block:
                     return True, f"Nifty {chg:+.2f}% — blocking shorts on up market"
 
-                # ORB flat-market filter — skip if Nifty hasn't moved enough
+                # Flat-market filter — skip breakout-type signals if Nifty hasn't
+                # moved enough (ORB always gated; other breakout strategies gated
+                # too when flat_market_block_all is enabled). Continuation signals
+                # like ema_pullback are exempt.
                 is_orb = signal_type in ("orb_long", "orb_short")
-                if is_orb and abs(chg) < self.orb_min_move:
+                is_gated_breakout = is_orb or (
+                    self.flat_market_block_all and signal_type not in self.flat_market_exempt
+                )
+                if is_gated_breakout and abs(chg) < self.orb_min_move:
+                    label = "ORB" if is_orb else signal_type
                     return True, (
                         f"Nifty flat ({chg:+.2f}%, need ±{self.orb_min_move}%) "
-                        f"— ORB signals unreliable on flat days"
+                        f"— {label} signals unreliable on flat days"
                     )
 
         return False, ""

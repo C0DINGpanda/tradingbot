@@ -86,7 +86,7 @@ strategy:
   enable_resistance_breakout: true
   enable_volume_breakout: true
   enable_52week_high_breakout: false  # less useful intraday
-  enable_bb_squeeze_breakout: true
+  enable_bb_squeeze_breakout: false  # disabled — net negative P&L (e.g. TARSONS -₹1,111), costs flip small wins to losses
   enable_bb_squeeze_short: false   # disabled — 50% win rate, net negative P&L
   enable_orb: true              # ✅ Opening Range Breakout — best intraday strategy
   enable_nr7: true              # ✅ NR7 Breakout — compressed energy explosion
@@ -98,6 +98,7 @@ strategy:
   orb_max_entry_delay_minutes: 30  # only take ORB signals within 30 min of range end (9:30–10:00)
 
   # ── Gap & Go settings ────────────────────────────────────────────────────
+  enable_gap_and_go_long: false  # disabled — 0/2 win rate, net -₹566 P&L; short side kept enabled
   gap_and_go:
     min_gap_pct: 1.0            # minimum gap % from previous close to qualify
     max_gap_pct: 5.0            # skip gaps >5% (too extended, likely to reverse)
@@ -115,6 +116,17 @@ strategy:
     slow_period: 21
     proximity_pct: 0.3          # price must touch within 0.3% of EMA21
     volume_multiplier: 1.2
+
+  # ── Trend continuation override ───────────────────────────────────────────
+  # Lets an EMA-pullback signal (score=3, normally below min_priority_score)
+  # through early if the stock is already trending hard intraday — avoids
+  # waiting for full multi-signal confirmation that only arrives near the
+  # end of the move (e.g. PETRONET 2026-09-08: confirmed short only fired
+  # at the bottom of a 3-hour decline).
+  trend_continuation:
+    enabled: true
+    min_move_pct: 1.0           # stock must be up/down >=1% from today's open
+    min_score: 2                # ema_pullback alone (score 3) clears this
 
   # ── SuperTrend filter ─────────────────────────────────────────────────────
   supertrend:
@@ -173,6 +185,13 @@ indicators:
     momentum_max: 40        # short: RSI below this = bearish momentum confirmed
     overbought: 75          # BLOCK long entry above this (extended, likely to pull back)
     oversold: 25            # BLOCK short entry below this (already dumped)
+    # Also block if RSI was at the OPPOSITE extreme within the last few bars
+    # and has now bounced back through the threshold — that's a reversal
+    # bounce in progress, not a confirmed trend continuation, and is risky
+    # to trade against (e.g. SHRIRAMFIN 2026-09-08: RSI 18→27 in ~35 min,
+    # shorted right into the bounce, stopped out shortly after).
+    block_recent_extreme_reversal: true
+    reversal_lookback_bars: 5
 
   atr:
     enabled: true
@@ -194,7 +213,9 @@ trade:
   # Max capital to deploy per trade (INR)
   max_capital_per_trade: 15000
   # Minimum own capital required to open a trade — skips if remaining daily cap is below this
-  min_capital_per_trade: 3000
+  # Raised from 3000 — small trades were flipped net-negative by the ~₹60 flat round-trip
+  # transaction cost (e.g. NESTLEIND +₹40 gross → -₹20 net). Bigger min size dilutes that cost.
+  min_capital_per_trade: 6000
   # MIS intraday margin multiplier (Zerodha provides up to 5x for equity MIS)
   # Effective buying power = max_capital_per_trade × mis_margin_multiplier
   # Set to 1.0 to disable margin and trade only with your own capital
@@ -214,6 +235,12 @@ trade:
   # Exit 50% at 1× risk reward → move SL to breakeven → trail the rest
   partial_exit:
     enabled: true                 # set false to disable partial exits
+    # After 1x-risk partial exit, runner's SL moves to breakeven + this fraction
+    # of the original risk distance (in the losing direction) instead of exact
+    # entry price — an exact-breakeven stop gets whipsawed by routine bounces
+    # (e.g. KARURVYSYA 2026-09-08: 0.45% bounce to entry stopped the runner
+    # out right before price kept falling for hours).
+    breakeven_buffer_pct_of_risk: 0.3
 
   profit_target_pct: 1.5        # intraday: realistic 1.5% target
   stop_loss_pct: 0.8            # intraday: tight 0.8% SL
@@ -258,13 +285,28 @@ trade:
     enabled: true
     trail_pct: 0.5              # tightened from 1.0 — locks in more profit, fewer force-closes at breakeven
     tighten_after_time: "12:30" # after 12:30 PM use tighter trail — momentum fading
-    tighten_trail_pct: 0.3      # 0.3% trail after 12:30 PM
+    tighten_trail_pct: 0.5      # loosened from 0.3 — 0.3% was clipping normal intraday noise (e.g. PAYTM 2026-09-07)
+    tighten_min_profit_pct: 0.3 # only apply the tighter trail once trade is up >=0.3% — avoids stopping out
+                                 # positions that haven't built a profit cushion yet (they keep the normal trail_pct)
 
   # ── Force-Close Behaviour ───────────────────────────────────────────────
   force_close:
     protect_profit: true               # if position is in profit, tighten trail first instead of flat close
     profit_protection_trail_pct: 0.1   # very tight trail on profitable positions at force-close time
     profit_protection_window_s: 60     # wait up to 60s for tight trail to fire before hard-closing
+    # At the 1:30 PM checkpoint only (not the 3:10 PM final one): if a
+    # profitable position is still near its best price so far (still
+    # trending favorably), hold it instead of closing — let the normal
+    # trailing stop keep managing it. If it has already pulled back from
+    # its peak by more than trend_buffer_pct, close it now.
+    hold_if_trending: true
+    trend_buffer_pct: 0.15
+    # If not trending anymore (pulled back from its peak) but still in
+    # profit at the 1:30 PM checkpoint: book half the remaining position
+    # now (lock in the gain) and let the other half keep riding under the
+    # normal trailing stop, instead of closing 100% immediately. Gives a
+    # chance to catch a later second leg while still guaranteeing some profit.
+    book_half_if_not_trending: true
 
   # ── Daily Loss Circuit Breaker ──────────────────────────────────────────
   max_daily_loss_pct: 2.0       # stop if down 2% on capital in a day
@@ -295,6 +337,16 @@ market_filters:
     block_shorts_above_pct: 0.5   # Nifty up >0.5% from open → block SHORT signals
     min_move_for_orb_pct: 0.3     # Nifty must move >0.3% either way for ORB to be valid
                                   # Flat Nifty = no institutional momentum = ORB fails
+    # Sep 2026 regime change: Nifty went flat/range-bound (VIX ~11-12), which
+    # correctly blocked ORB most days — but other breakout strategies
+    # (bb_squeeze, gap_and_go, volume_breakout/breakdown) kept firing on
+    # those same flat days and bled money (-₹3,441 over 6 days, Sep 1-10)
+    # while ORB (the only real edge) sat idle. Apply the same flat-day gate
+    # to all breakout-type strategies, not just ORB.
+    flat_market_block_all_breakouts: true
+    flat_market_exempt_signals:      # continuation signals — don't need index confirmation
+      - ema_pullback_long
+      - ema_pullback_short
 
 # ─────────────────────────────────────────
 #  Sector Momentum Filter

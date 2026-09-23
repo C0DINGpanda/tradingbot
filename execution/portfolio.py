@@ -61,7 +61,9 @@ def init_db():
         for col in ("highest_seen REAL", "direction TEXT DEFAULT 'long'",
                     "gross_pnl REAL", "transaction_costs REAL",
                     "partial_exit_done INTEGER DEFAULT 0",
-                    "remaining_quantity INTEGER"):
+                    "remaining_quantity INTEGER",
+                    "partial_realized_gross REAL DEFAULT 0",
+                    "partial_realized_costs REAL DEFAULT 0"):
             try:
                 conn.execute(f"ALTER TABLE positions ADD COLUMN {col}")
                 conn.commit()
@@ -109,44 +111,70 @@ def update_trailing_stop(pos_id: int, new_stop: float, new_highest: float):
         conn.commit()
 
 
-def close_position(pos_id: int, sell_price: float, sell_order_id: str):
+def close_position(pos_id: int, sell_price: float, sell_order_id: str) -> tuple[float, float, float]:
+    """Closes the position and returns (total_gross, total_net, total_costs)
+    across the whole position — including any earlier partial-exit leg."""
     with _get_conn() as conn:
         row = conn.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
         if row is None:
             logger.warning(f"Position {pos_id} not found")
-            return
+            return 0.0, 0.0, 0.0
         direction = row["direction"] if row["direction"] else "long"
-        gross, net, costs = _net_pnl(row["buy_price"], sell_price, row["quantity"], direction)
+        # Close only the REMAINING quantity (a prior partial exit may have
+        # already booked P&L on part of the position — using the full
+        # original quantity here would double-count/ignore that leg).
+        final_qty = row["remaining_quantity"] or row["quantity"]
+        gross, net, costs = _net_pnl(row["buy_price"], sell_price, final_qty, direction)
+
+        # Fold in any P&L already realised from a partial exit
+        prior_gross  = row["partial_realized_gross"] or 0.0
+        prior_costs  = row["partial_realized_costs"] or 0.0
+        total_gross  = round(gross + prior_gross, 2)
+        total_costs  = round(costs["total_cost"] + prior_costs, 2)
+        total_net    = round(total_gross - total_costs, 2)
+
         conn.execute(
             """UPDATE positions SET status='closed', sell_price=?, sell_order_id=?,
                sold_at=?, gross_pnl=?, transaction_costs=?, pnl=? WHERE id=?""",
             (sell_price, sell_order_id, datetime.now().isoformat(),
-             gross, costs["total_cost"], net, pos_id),
+             total_gross, total_costs, total_net, pos_id),
         )
         conn.commit()
     event = "COVER" if direction == "short" else "SELL"
-    log_event(event, row["symbol"], sell_price, row["quantity"], sell_order_id,
-              f"direction={direction}, gross_pnl={gross:.2f}, costs={costs['total_cost']:.2f}, net_pnl={net:.2f}")
+    log_event(event, row["symbol"], sell_price, final_qty, sell_order_id,
+              f"direction={direction}, gross_pnl={total_gross:.2f}, costs={total_costs:.2f}, net_pnl={total_net:.2f}")
+    return total_gross, total_net, total_costs
 
 
 def partial_exit_position(pos_id: int, exit_price: float, exit_qty: int, order_id: str):
     """
-    Record a partial exit: reduces remaining_quantity and marks partial_exit_done.
-    The position stays 'open' until fully closed.
+    Record a partial exit: books gross/net P&L for the exited lot, reduces
+    remaining_quantity, and marks partial_exit_done. The position stays
+    'open' until fully closed (final close adds the remaining leg's P&L
+    on top of what's accumulated here).
     """
     with _get_conn() as conn:
         row = conn.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
         if row is None:
             return
+        direction = row["direction"] if row["direction"] else "long"
         remaining = (row["remaining_quantity"] or row["quantity"]) - exit_qty
+
+        gross, net, costs = _net_pnl(row["buy_price"], exit_price, exit_qty, direction)
+        prior_gross = row["partial_realized_gross"] or 0.0
+        prior_costs = row["partial_realized_costs"] or 0.0
+        new_gross   = round(prior_gross + gross, 2)
+        new_costs   = round(prior_costs + costs["total_cost"], 2)
+
         conn.execute(
             """UPDATE positions SET partial_exit_done=1, remaining_quantity=?,
-               stop_loss=buy_price WHERE id=?""",
-            (remaining, pos_id),
+               stop_loss=buy_price, partial_realized_gross=?, partial_realized_costs=?
+               WHERE id=?""",
+            (remaining, new_gross, new_costs, pos_id),
         )
         conn.commit()
     log_event("PARTIAL_EXIT", row["symbol"], exit_price, exit_qty, order_id,
-              f"partial exit, remaining={remaining}")
+              f"partial exit, gross={gross:.2f}, remaining={remaining}")
 
 
 def get_open_positions() -> list[dict]:

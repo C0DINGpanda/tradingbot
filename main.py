@@ -309,14 +309,17 @@ def main():
             trigger="cron",
             hour=13, minute=30,
             id="force_close_2pm",
+            kwargs={"is_final": False},  # hold positions still trending favorably instead of flat-closing
         )
         scheduler.add_job(
             order_mgr.force_close_all,
             trigger="cron",
             hour=15, minute=10,
             id="force_close_eod",
+            kwargs={"is_final": True},   # hard deadline — always close everything
         )
-        logger.info("Force-close jobs scheduled at 01:30 PM and 03:10 PM.")
+        logger.info("Force-close jobs scheduled at 01:30 PM (hold-if-trending) and 03:10 PM (final).")
+
 
     # Daily summary alert + circuit breaker reset at 3:30 PM
     alerter = Alerter(cfg)

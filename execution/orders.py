@@ -248,9 +248,14 @@ class OrderManager:
         # Tighten trail after 12:30 PM — trades still open are losing momentum
         tsl_cfg     = self.t_cfg.get("trailing_stop_loss", {})
         tighten_after = tsl_cfg.get("tighten_after_time", "12:30")
-        tighten_pct   = tsl_cfg.get("tighten_trail_pct", 0.3)
+        tighten_pct   = tsl_cfg.get("tighten_trail_pct", 0.5)
+        # Only apply the tighter trail once the trade has a real cushion —
+        # otherwise routine noise/bounces stop it out right before the move
+        # resumes (e.g. PAYTM 2026-09-07: tightened trail clipped on a 0.9%
+        # bounce, price then continued in the original direction).
+        tighten_min_profit_pct = tsl_cfg.get("tighten_min_profit_pct", 0.3)
         tighten_t = _dt.strptime(tighten_after, "%H:%M").time()
-        effective_trail = tighten_pct if now_t >= tighten_t else self.trail_pct
+        past_tighten_time = now_t >= tighten_t
 
         for pos in get_open_positions():
             symbol    = pos["symbol"]
@@ -261,6 +266,14 @@ class OrderManager:
 
             # Effective quantity (may differ from original after partial exit)
             active_qty = pos.get("remaining_quantity") or pos["quantity"]
+
+            entry_price = pos["buy_price"]
+            if direction == "short":
+                profit_pct = (entry_price - ltp) / entry_price * 100 if entry_price else 0
+            else:
+                profit_pct = (ltp - entry_price) / entry_price * 100 if entry_price else 0
+            use_tighten = past_tighten_time and profit_pct >= tighten_min_profit_pct
+            effective_trail = tighten_pct if use_tighten else self.trail_pct
 
             if direction == "short":
                 if self.use_trailing:
@@ -293,30 +306,39 @@ class OrderManager:
                 entry   = pos["buy_price"]
                 sl_dist = abs(entry - pos["stop_loss"])
                 if sl_dist > 0:
+                    # Buffer beyond exact breakeven — an exact-entry stop gets
+                    # whipsawed by routine bounces/noise (e.g. KARURVYSYA
+                    # 2026-09-08: bounced 0.45% back to entry, stopped out the
+                    # runner, price then kept falling for hours). Sized as a
+                    # fraction of the original risk distance so it scales
+                    # with each stock's own volatility.
+                    buffer_frac = partial_cfg.get("breakeven_buffer_pct_of_risk", 0.3)
                     if direction == "long" and ltp >= entry + sl_dist:
                         half_qty = active_qty // 2
+                        new_sl = round(entry - buffer_frac * sl_dist, 2)
                         logger.info(
                             f"  🎯 {symbol} partial exit {half_qty}×@₹{ltp} "
-                            f"(1×risk hit) → SL→breakeven ₹{entry}"
+                            f"(1×risk hit) → SL→breakeven+buffer ₹{new_sl}"
                         )
                         oid = self._place_order(symbol, "SELL", half_qty)
                         if oid:
                             partial_exit_position(pos["id"], ltp, half_qty, oid)
                             pos = {**pos, "partial_exit_done": 1,
                                    "remaining_quantity": active_qty - half_qty,
-                                   "stop_loss": entry}
+                                   "stop_loss": new_sl}
                     elif direction == "short" and ltp <= entry - sl_dist:
                         half_qty = active_qty // 2
+                        new_sl = round(entry + buffer_frac * sl_dist, 2)
                         logger.info(
                             f"  🎯 {symbol} partial exit {half_qty}×@₹{ltp} "
-                            f"(1×risk hit) → SL→breakeven ₹{entry}"
+                            f"(1×risk hit) → SL→breakeven+buffer ₹{new_sl}"
                         )
                         oid = self._place_order(symbol, "BUY", half_qty)
                         if oid:
                             partial_exit_position(pos["id"], ltp, half_qty, oid)
                             pos = {**pos, "partial_exit_done": 1,
                                    "remaining_quantity": active_qty - half_qty,
-                                   "stop_loss": entry}
+                                   "stop_loss": new_sl}
                         continue
 
             if hit_target:
@@ -330,7 +352,7 @@ class OrderManager:
             logger.info(f"🔔 {tag} {symbol} [{direction}] @ ₹{ltp} → closing ({reason})")
             self._execute_sell(pos, reason, ltp=ltp)
 
-    def force_close_all(self, ltp_map: dict[str, float] = {}):
+    def force_close_all(self, ltp_map: dict[str, float] = {}, is_final: bool = True):
         """Close all MIS positions before 3:15 PM EOD penalty.
 
         Improvements vs plain market-close:
@@ -340,6 +362,13 @@ class OrderManager:
         3. Profit protection: if a position is in profit, tighten trail to
            0.1% and let check_and_sell handle it; only hard-close if it still
            hasn't triggered within `profit_protection_window_s` seconds.
+        4. At the non-final checkpoint (1:30 PM): if a profitable position is
+           still trending favorably (LTP near its best price so far, not
+           pulled back), hold it and skip force-close entirely — let the
+           normal trailing stop keep managing it. If it's no longer trending
+           (already pulled back from its peak), close it now instead of
+           waiting. The 3:10 PM final call (is_final=True) always closes
+           everything regardless of trend — that's the hard MIS deadline.
         """
         positions = get_open_positions()
         if not positions:
@@ -368,6 +397,9 @@ class OrderManager:
         protect_profit   = fc_cfg.get("protect_profit", True)
         protect_window_s = fc_cfg.get("profit_protection_window_s", 60)
         tight_trail_pct  = fc_cfg.get("profit_protection_trail_pct", 0.1)
+        hold_if_trending = fc_cfg.get("hold_if_trending", True)
+        trend_buffer_pct = fc_cfg.get("trend_buffer_pct", 0.15)
+        book_half_if_not_trending = fc_cfg.get("book_half_if_not_trending", True)
 
         # ── 2. Staged exit: losers first, winners last ─────────────────────
         def unrealised_pnl(pos):
@@ -381,18 +413,63 @@ class OrderManager:
 
         positions_sorted = sorted(positions, key=unrealised_pnl)  # losers first
 
+
         deferred = []  # profitable positions given profit-protection window
 
         for pos in positions_sorted:
             ltp    = ltp_map.get(pos["symbol"], 0.0)
             pnl    = unrealised_pnl(pos)
             symbol = pos["symbol"]
+            direction = pos.get("direction", "long")
+            entry  = pos["buy_price"]
 
-            # ── 3. Profit protection ────────────────────────────────────────
+            # ── 3a. Hold if still trending favorably (non-final checkpoint only) ──
+            if not is_final and hold_if_trending and ltp > 0 and pnl > 0:
+                extreme = pos.get("highest_seen") or entry
+                if direction == "long":
+                    trending = ltp >= extreme * (1 - trend_buffer_pct / 100)
+                else:
+                    trending = ltp <= extreme * (1 + trend_buffer_pct / 100)
+                if trending:
+                    logger.info(
+                        f"  📈 {symbol} still trending favorably (ltp ₹{ltp} near best ₹{extreme}) "
+                        f"— holding, skipping 1:30 PM force-close"
+                    )
+                    continue
+
+                # ── 3a-2. Not trending anymore, but still in profit: book half
+                # now and let the rest keep riding under normal trailing-stop
+                # management, instead of an all-or-nothing close. (e.g. INDGN
+                # 2026-09-15: pulled back from its low by 1:30 PM, got fully
+                # force-closed for a small net loss after costs — half of it
+                # could have kept running for the later leg down.)
+                if book_half_if_not_trending:
+                    active_qty = pos.get("remaining_quantity") or pos["quantity"]
+                    half_qty = active_qty // 2
+                    if half_qty >= 1:
+                        close_side = "BUY" if direction == "short" else "SELL"
+                        oid = self._place_order(symbol, close_side, half_qty)
+                        if oid:
+                            partial_exit_position(pos["id"], ltp, half_qty, oid)
+                            # Protect the booked gain on the remainder — tighten
+                            # trail so it can't give back everything.
+                            if direction == "long":
+                                new_sl = round(ltp * (1 - tight_trail_pct / 100), 2)
+                                new_sl = max(new_sl, entry)
+                            else:
+                                new_sl = round(ltp * (1 + tight_trail_pct / 100), 2)
+                                new_sl = min(new_sl, entry)
+                            update_trailing_stop(pos["id"], new_sl, ltp)
+                            logger.info(
+                                f"  🍰 {symbol} not trending — booked half ({half_qty}) @ ₹{ltp}, "
+                                f"letting remaining {active_qty - half_qty} ride with protective SL ₹{new_sl}"
+                            )
+                            continue
+
+            # ── 3b. Profit protection ────────────────────────────────────────
             if protect_profit and ltp > 0 and pnl > 0:
                 # Tighten trail to 0.1% and let the normal sell-monitor fire
-                entry   = pos["buy_price"]
-                if pos.get("direction", "long") == "long":
+                if direction == "long":
                     new_stop = round(ltp * (1 - tight_trail_pct / 100), 2)
                     new_stop = max(new_stop, entry)  # never below breakeven
                 else:
@@ -427,7 +504,11 @@ class OrderManager:
     def _execute_sell(self, pos: dict, reason: str, ltp: float = 0.0):
         direction  = pos.get("direction", "long")
         close_side = "BUY" if direction == "short" else "SELL"
-        order_id   = self._place_order(pos["symbol"], close_side, pos["quantity"])
+        # Close only the REMAINING quantity — a prior partial exit already
+        # covered/sold part of this position, so using the full original
+        # quantity here would over-cover/over-sell (and mis-state P&L).
+        close_qty  = pos.get("remaining_quantity") or pos["quantity"]
+        order_id   = self._place_order(pos["symbol"], close_side, close_qty)
         if not order_id:
             return
         # Pass current LTP as signal_price so dry-run exits use the real market price,
@@ -438,14 +519,13 @@ class OrderManager:
             logger.error(f"Close order for {pos['symbol']} not confirmed — check manually!")
             self.alerter.error(f"Close order not confirmed for {pos['symbol']}!")
             return
-        close_position(pos["id"], fill_price, order_id)
-        gross, net, costs = _net_pnl(pos["buy_price"], fill_price, pos["quantity"], direction)
+        total_gross, total_net, total_costs = close_position(pos["id"], fill_price, order_id)
         tag = "📉 COVERED" if direction == "short" else "📈 SOLD"
         logger.info(
-            f"✅ {'[DRY] ' if self.dry_run else ''}{tag} {pos['quantity']} × {pos['symbol']} "
-            f"@ ₹{fill_price} | gross=₹{gross:+.2f} costs=₹{costs['total_cost']:.2f} net=₹{net:+.2f} | {reason}"
+            f"✅ {'[DRY] ' if self.dry_run else ''}{tag} {close_qty} × {pos['symbol']} "
+            f"@ ₹{fill_price} | gross=₹{total_gross:+.2f} costs=₹{total_costs:.2f} net=₹{total_net:+.2f} | {reason}"
         )
-        self.alerter.sell(pos["symbol"], pos["quantity"], fill_price, net, reason)
+        self.alerter.sell(pos["symbol"], close_qty, fill_price, total_net, reason)
 
     def _place_order(self, symbol: str, transaction_type: str, quantity: int) -> Optional[str]:
         if self.dry_run:
